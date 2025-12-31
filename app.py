@@ -4,8 +4,17 @@ import uuid
 import subprocess
 import threading
 import webbrowser
+import shutil
 from flask import Flask, request, jsonify, render_template, send_file
+# AI Agent: 导入 faster_whisper（已升级到 1.2.1 版本，支持 av>=11）
 from faster_whisper import WhisperModel
+# AI Agent: 导入繁简转换库
+try:
+    import zhconv
+    ZHCONV_AVAILABLE = True
+except ImportError:
+    ZHCONV_AVAILABLE = False
+    print("警告: zhconv 未安装，无法进行繁简转换。请运行: pip install zhconv")
 import ollama_processor
 
 app = Flask(__name__)
@@ -21,6 +30,34 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # 全局变量存储模型
 whisper_model = None
+
+# AI Agent: 查找 FFmpeg 可执行文件路径
+def find_ffmpeg():
+    """查找 FFmpeg 可执行文件路径"""
+    # 首先尝试使用 shutil.which 查找（会在 PATH 中查找）
+    ffmpeg_path = shutil.which('ffmpeg')
+    if ffmpeg_path:
+        return ffmpeg_path
+    
+    # 如果找不到，尝试常见路径
+    common_paths = [
+        r'F:\Ffmpeg\ffmpeg\bin\ffmpeg.exe',  # 根据 where.exe 的结果
+        r'C:\ffmpeg\bin\ffmpeg.exe',
+        r'C:\Program Files\ffmpeg\bin\ffmpeg.exe',
+    ]
+    
+    for path in common_paths:
+        if os.path.exists(path):
+            return path
+    
+    return None
+
+# 初始化时查找 FFmpeg 路径
+FFMPEG_PATH = find_ffmpeg()
+if not FFMPEG_PATH:
+    print("警告: 未找到 FFmpeg，请确保 FFmpeg 已安装并添加到 PATH 环境变量")
+else:
+    print(f"找到 FFmpeg: {FFMPEG_PATH}")
 
 @app.route('/')
 def index():
@@ -88,6 +125,8 @@ def extract_subtitles():
         enable_vad = data.get('enable_vad', True)
         enable_gpu = data.get('enable_gpu', False)
         enable_word_timestamps = data.get('enable_word_timestamps', False)
+        # AI Agent: 添加繁简转换选项，默认为 True（自动转换为简体中文）
+        convert_to_simplified = data.get('convert_to_simplified', True)
         
         if not file_path or not os.path.exists(file_path):
             return jsonify({'error': '文件不存在'})
@@ -115,9 +154,22 @@ def extract_subtitles():
         
         # 提取音频
         audio_path = os.path.join(OUTPUT_FOLDER, f"{file_id}_audio.wav")
-        subprocess.run([
-            'ffmpeg', '-i', file_path, '-ar', '16000', '-ac', '1', '-y', audio_path
-        ], check=True, capture_output=True)
+        
+        # AI Agent: 使用找到的 FFmpeg 路径，如果找不到则返回错误
+        if not FFMPEG_PATH:
+            return jsonify({'error': 'FFmpeg 未找到，请确保 FFmpeg 已安装并添加到 PATH 环境变量'})
+        
+        try:
+            result = subprocess.run([
+                FFMPEG_PATH, '-i', file_path, '-ar', '16000', '-ac', '1', '-y', audio_path
+            ], check=True, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return jsonify({'error': 'FFmpeg 处理超时，请检查视频文件是否过大'})
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr if e.stderr else str(e)
+            return jsonify({'error': f'FFmpeg 处理失败: {error_msg}'})
+        except FileNotFoundError:
+            return jsonify({'error': f'FFmpeg 未找到: {FFMPEG_PATH}，请检查 FFmpeg 安装路径'})
         
         # 转录
         segments, info = whisper_model.transcribe(
@@ -127,13 +179,21 @@ def extract_subtitles():
             word_timestamps=enable_word_timestamps
         )
         
+        # AI Agent: 繁简转换函数
+        def convert_text(text):
+            """将文本转换为简体中文（如果需要）"""
+            if convert_to_simplified and ZHCONV_AVAILABLE:
+                # 检测是否为繁体中文，如果是则转换为简体
+                return zhconv.convert(text, 'zh-cn')
+            return text
+        
         # 保存字幕
         with open(output_path, 'w', encoding='utf-8') as f:
             if output_format == 'srt':
                 for i, segment in enumerate(segments, 1):
                     start = segment.start
                     end = segment.end
-                    text = segment.text.strip()
+                    text = convert_text(segment.text.strip())
                     
                     f.write(f"{i}\n")
                     f.write(f"{format_time_srt(start)} --> {format_time_srt(end)}\n")
@@ -142,7 +202,8 @@ def extract_subtitles():
                 # 其他格式处理
                 f.write("# 字幕内容\n")
                 for segment in segments:
-                    f.write(f"[{format_time_txt(segment.start)}] {segment.text.strip()}\n")
+                    text = convert_text(segment.text.strip())
+                    f.write(f"[{format_time_txt(segment.start)}] {text}\n")
         
         # 清理临时文件
         if os.path.exists(audio_path):
